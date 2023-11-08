@@ -125,7 +125,6 @@ impl Plugin for Distortion {
     // CURRENT PROBLEMS:
     // 1: positive side of the threshold slider seemingly does nothing
     // 2: Mix slider should be 0 to 1 instead of -1 to 1
-    // 3: Getting weird, unpleasant clipping noises
     // 4: Threshold should be in decibels for sure
 
     fn process(
