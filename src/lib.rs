@@ -1,12 +1,22 @@
+use atomic_float::AtomicF32;
+use nih_plug_vizia::ViziaState;
 use nih_plug::prelude::*;
 use std::sync::Arc;
+
+mod editor;
+const PEAK_METER_DECAY_MS: f64 = 150.0;
+
 
 // This is a shortened version of the gain example with most comments removed, check out
 // https://github.com/robbert-vdh/nih-plug/blob/master/plugins/examples/gain/src/lib.rs to get
 // started
 
-struct Distortion {
+pub struct Distortion {
     params: Arc<DistortionParams>,
+
+    peak_meter_decay_weight: f32,
+
+    peak_meter: Arc<AtomicF32>,
 }
 
 #[derive(Params)]
@@ -21,12 +31,17 @@ struct DistortionParams {
     #[id = "mix"]
     pub mix: FloatParam,
 
+    #[persist = "editor-state"]
+    editor_state: Arc<ViziaState>,
+
 }
 
 impl Default for Distortion {
     fn default() -> Self {
         Self {
             params: Arc::new(DistortionParams::default()),
+            peak_meter_decay_weight: 1.0,
+            peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
         }
     }
 }
@@ -34,17 +49,21 @@ impl Default for Distortion {
 impl Default for DistortionParams {
     fn default() -> Self {
         Self {
+            editor_state: editor::default_state(),
             threshold: FloatParam::new(
                 "Threshold",
-                0.0,
+                0.5,
                 FloatRange::Skewed {
-                    min: -0.125,
-                    max: 0.125,
+                    min: 0.001,
+                    max: 1.0,
                     factor: 1.0,
                 },
             )
             .with_smoother(SmoothingStyle::Logarithmic(50.0))
-            .with_unit(" dB"),
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
+            .with_string_to_value(formatters::s2v_f32_gain_to_db()),
+
             mix: FloatParam::new(
                 "Mix",
                 0.0,
@@ -62,6 +81,7 @@ impl Default for DistortionParams {
         }
     }
 }
+
 
 impl Plugin for Distortion {
     const NAME: &'static str = "distortion_plugin";
@@ -105,6 +125,14 @@ impl Plugin for Distortion {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        editor::create(
+            self.params.clone(),
+            self.peak_meter.clone(),
+            self.params.editor_state.clone(),
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
@@ -114,6 +142,9 @@ impl Plugin for Distortion {
         // Resize buffers and perform other potentially expensive initialization operations here.
         // The `reset()` function is always called right after this function. You can remove this
         // function if you do not need it.
+        self.peak_meter_decay_weight = 0.25f64
+        .powf((_buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
+        as f32;
         true
     }
 
@@ -136,6 +167,8 @@ impl Plugin for Distortion {
         for channel_samples in buffer.iter_samples() {
             // Smoothing is optionally built into the parameters themselves
 
+            let mut amplitude = 0.0;
+            let num_samples = channel_samples.len();
 
             let threshold = self.params.threshold.smoothed.next();
             let mix = self.params.mix.smoothed.next();
@@ -157,6 +190,23 @@ impl Plugin for Distortion {
                 // Combine distorted signal with original based on mix
                 *sample = ((1.0-mix) * clean_out) + (mix * output);
             }
+            // To save resources, a plugin can (and probably should!) only perform expensive
+            // calculations that are only displayed on the GUI while the GUI is open
+            if self.params.editor_state.is_open() {
+                amplitude = (amplitude / num_samples as f32).abs();
+                let current_peak_meter = self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
+                let new_peak_meter = if amplitude > current_peak_meter {
+                    amplitude
+                } else {
+                    current_peak_meter * self.peak_meter_decay_weight
+                        + amplitude * (1.0 - self.peak_meter_decay_weight)
+                };
+
+                self.peak_meter
+                    .store(new_peak_meter, std::sync::atomic::Ordering::Relaxed)
+            }
+
+
         }
 
         ProcessStatus::Normal
